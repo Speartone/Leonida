@@ -1,12 +1,16 @@
 // Fence events the host D3D12 runtime (RTX 5070 and WARP) sets or refuses, checked on the Vulkan-backed device and,
 // when present, on the host devices too: releasing a fence completes the events still waiting on it (ALL counts it
-// as one fence reached, ANY is satisfied), and SetEventOnMultipleFenceCompletion with no fences is E_INVALIDARG and
-// sets nothing. No shaders or game data. LEONIDA_VK_VALIDATION=1 fails the test on any validation error.
+// as one fence reached, ANY is satisfied), also while the waits it reached are being dispatched, and
+// SetEventOnMultipleFenceCompletion with no fences is E_INVALIDARG and sets nothing. No shaders or game data.
+// LEONIDA_VK_VALIDATION=1 fails the test on any validation error.
 #include "vk_test_device.h"
 #include "host_adapter.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
+
+#include <chrono>
+#include <memory>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "%s line %d: %s\n", who, __LINE__, #condition); return 1; } \
@@ -55,6 +59,28 @@ int check(ID3D12Device* device, const char* who) {
             EXPECT(SUCCEEDED(other->Signal(1)));
             EXPECT(event.set_within(2000));
         }
+    }
+    // A fence released just after it was signaled, while the layer is still working through the waits that reached: no
+    // event is lost. The delay before the release walks over the time that takes; where in the batch the release
+    // lands is up to the threads (vk_fence_dispatcher_sync_test has the same case with the batch held still).
+    for (int round = 0; round < 64; ++round) {
+        constexpr int kWaits = 256;
+        ID3D12Fence* fence = nullptr;
+        EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))));
+        Ref<ID3D12Fence> owner{fence};
+        const auto events = std::make_unique<Event[]>(kWaits);
+        for (int i = 0; i < kWaits; ++i) {
+            const UINT64 value = 1;
+            EXPECT(SUCCEEDED(i % 3 == 2 ? fence->SetEventOnCompletion(value, events[i].h)
+                                        : device1->SetEventOnMultipleFenceCompletion(&fence, &value, 1,
+                                                                                     i % 3 ? ANY : ALL, events[i].h)));
+        }
+        EXPECT(SUCCEEDED(fence->Signal(1)));
+        const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(round * 4);
+        while (std::chrono::steady_clock::now() < until) YieldProcessor();
+        owner.p = nullptr;
+        fence->Release();
+        for (int i = 0; i < kWaits; ++i) EXPECT(events[i].set_within(2000));
     }
     {  // No fences: refused, with or without an event, and the event is left alone.
         Ref<ID3D12Fence> fence;

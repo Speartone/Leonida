@@ -1496,13 +1496,14 @@ public:
         return S_OK;
     }
 
-    // Counts `waiter` down once this fence reaches `value`: now if it has, else via the centralized dispatcher.
+    // Counts `waiter` down once this fence reaches `value`: now if it has, else via the centralized dispatcher, or
+    // by the time the fence is released (a notification is never dropped by the cancel in ~Fence).
     void notify(UINT64 value, std::shared_ptr<FenceWaiter> waiter) {
         if (context_.is_device_lost() || fence_.completed() >= value) {
             waiter->hit();
             return;
         }
-        context_.enqueue_fence_callback(fence_.semaphore(), value, [w = std::move(waiter)] { w->hit(); });
+        context_.enqueue_fence_notification(fence_.semaphore(), value, [w = std::move(waiter)] { w->hit(); });
     }
 
     static Fence* from(IUnknown* object) { return Child::from<Fence>(object); }
