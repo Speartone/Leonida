@@ -1496,8 +1496,9 @@ public:
         return S_OK;
     }
 
-    // Counts `waiter` down once this fence reaches `value`: now if it has, else via the centralized dispatcher, or
-    // by the time the fence is released (a notification is never dropped by the cancel in ~Fence).
+    // Counts `waiter` down once this fence reaches `value`: now if it has, else via the centralized dispatcher, or in
+    // ~Fence, whose cancel never drops a notification. That is not always the application's Release(): a queue's Wait
+    // or held Signal keeps the fence, and this wait with it.
     void notify(UINT64 value, std::shared_ptr<FenceWaiter> waiter) {
         if (context_.is_device_lost() || fence_.completed() >= value) {
             waiter->hit();

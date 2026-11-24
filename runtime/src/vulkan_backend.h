@@ -562,11 +562,16 @@ public:
     // call cancel() for a later entry in the same batch, which marks that entry cancelled so it is skipped before
     // it can use the semaphore. A callback running on another thread must still be waited for.
     // A cancelled entry still in pending_ is dispatched by cancel() itself (callback and bookkeeping both run).
-    // From a ready batch cancel() takes the events and notifications that have not started, and dispatches them too:
-    // either way what is told about the wait is told once, before cancel() returns, so a D3D12 fence's release leaves
-    // no use of its waits' events behind. A callback that uses the semaphore is dropped from the batch instead. The
-    // held Signal op's count is therefore not decremented for it: harmless when ~Fence cancels, but a queue destroyed
-    // with a held Signal cancels the waits of a fence that lives on.
+    // From a ready batch cancel() takes the events and notifications that have not started, and dispatches them too,
+    // after a callback of the same semaphore that is already running. Each is told once. A callback that uses the
+    // semaphore is dropped from the batch instead. The held Signal op's count is therefore not decremented for it:
+    // harmless when ~Fence cancels, but a queue destroyed with a held Signal cancels the waits of a fence that lives
+    // on.
+    // What a cancel() took, it has told when it returns. That holds for the call that took it only: another cancel() of
+    // the same semaphore, from a second thread or from inside something the first one is telling, finds nothing left
+    // to take and may return before the first has told it all. It says nothing about waits that no cancel() reaches
+    // either: a D3D12 fence that a queue still references outlives the application's Release(), and its waits stay
+    // registered, with the events they name, until it is destroyed.
     struct DispatchSlot {
         VkSemaphore semaphore = VK_NULL_HANDLE;
         std::thread::id owner;
@@ -1548,7 +1553,9 @@ public:
     void enqueue_fence_callback(VkSemaphore sem, std::uint64_t value, std::function<void()> cb) {
         if (fence_dispatcher_) fence_dispatcher_->enqueue_callback(sem, value, std::move(cb));
     }
-    // `cb` must not use the semaphore or its fence; a cancel_fence_waits() runs it, once, before it returns.
+    // `cb` must not use the semaphore or its fence. It runs once: here, on the dispatcher's thread, or in the
+    // cancel_fence_waits() that takes it, before that one returns. (A context that is destroyed with the wait still
+    // pending drops it.)
     void enqueue_fence_notification(VkSemaphore sem, std::uint64_t value, std::function<void()> cb) {
         if (fence_dispatcher_)
             fence_dispatcher_->enqueue_callback(sem, value, std::move(cb),

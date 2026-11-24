@@ -11,10 +11,13 @@
 //   7. A cancel() from another thread during a ready batch drops the semaphore work that has not started, but
 //      completes the notification and the event of the cancelled fence, each once, before it returns.
 //   8. The same for a re-entrant cancel(), and a notification completed that way can cancel and enqueue waits itself.
-//   9. ALL and ANY multi-fence waits (the D3D12 layer's FenceWaiter, Windows) set their event whichever of their
-//      fences are cancelled in the batch, and never again once it was set or all were cancelled: it may be closed then.
+//   9. ALL and ANY multi-fence waits are satisfied once, by the right fence, whichever order their fences are released
+//      in and however far the batch has got, and never again (with the D3D12 layer's FenceWaiter too, on Windows).
 //  10. A cancel() of waits that are still pending runs both kinds, once, before it returns.
 //  11. Device loss completes what is pending, and a cancel() during that drain behaves as in 7.
+//  12. A cancel() of a semaphore with one callback running and others not started takes those, waits for the one that
+//      runs, tells them then, and leaves no use of the semaphore behind.
+// After 7 to 9, 11 and 12 nothing of the batch is left in the dispatcher.
 // Skips with exit code 77 when no Vulkan 1.3 device is available. No game data.
 #include "vk_test_device.h"
 #include "../src/vulkan_backend.h"
@@ -22,6 +25,8 @@
 #include "../shims/d3d12_fence_waiter.h"
 #endif
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -120,6 +125,38 @@ bool wait_until(Done done, int timeout_ms = 2000) {
     return true;
 }
 
+// The dispatcher's batch in flight, which it keeps private: to see that a cancel() on another thread has got as far as
+// taking its waits, and that a batch leaves nothing behind. (An explicit instantiation may name private members.)
+using BatchSlots = std::vector<std::shared_ptr<leonida::FenceWaitDispatcher::DispatchSlot>>;
+BatchSlots& batch_slots(leonida::FenceWaitDispatcher&);
+std::mutex& batch_mutex(leonida::FenceWaitDispatcher&);
+leonida::FenceWaitDispatcher& dispatcher(leonida::VulkanContext&);
+template<auto Slots, auto Mutex, auto Dispatcher>
+struct Reveal {
+    friend BatchSlots& batch_slots(leonida::FenceWaitDispatcher& d) { return d.*Slots; }
+    friend std::mutex& batch_mutex(leonida::FenceWaitDispatcher& d) { return d.*Mutex; }
+    friend leonida::FenceWaitDispatcher& dispatcher(leonida::VulkanContext& c) { return *(c.*Dispatcher); }
+};
+template struct Reveal<&leonida::FenceWaitDispatcher::dispatching_, &leonida::FenceWaitDispatcher::mutex_,
+                       &leonida::VulkanContext::fence_dispatcher_>;
+
+std::size_t cancelled_slots(leonida::VulkanContext& context, VkSemaphore sem) {
+    auto& d = dispatcher(context);
+    std::lock_guard lock(batch_mutex(d));
+    const auto& slots = batch_slots(d);
+    return std::size_t(std::count_if(slots.begin(), slots.end(),
+                                     [&](const auto& slot) { return slot->semaphore == sem && slot->cancelled; }));
+}
+
+// The batch is over: its last callback has been seen, so only the dispatcher's own bookkeeping may still be running.
+bool batch_left_nothing(leonida::VulkanContext& context) {
+    return wait_until([&] {
+        auto& d = dispatcher(context);
+        std::lock_guard lock(batch_mutex(d));
+        return batch_slots(d).empty();
+    });
+}
+
 // Makes one batch of everything `fill` enqueues and signals: run() is held after vkWaitSemaphores returned and before
 // it reads a counter, so it finds all of it at once, in the order it was enqueued. `parked` gives run() a wait to be
 // in; its value is never reached and the caller cancels it.
@@ -158,6 +195,58 @@ struct Waits {
         context.enqueue_fence_callback(sem, value, [this] { ++used_semaphore; });
         context.enqueue_fence_wait(sem, value, this);
     }
+};
+
+// A multi-fence wait: counts down as the D3D12 layer's FenceWaiter does (which is Windows-only), and counts how often
+// it was satisfied. On Windows a real FenceWaiter counts along. Its event's handle stays open to the end as a
+// tripwire: setting it after it was consumed would use a handle that the application may have closed by then, and a
+// closed handle would not show that, as SetEvent on one just fails.
+class MultiWait {
+public:
+    explicit MultiWait(unsigned count) : remaining_(count) {
+#ifdef _WIN32
+        event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        EXPECT(event_);
+        waiter_ = std::make_unique<rt::d3d12::FenceWaiter>(event_, count);
+#endif
+    }
+    ~MultiWait() {
+#ifdef _WIN32
+        CloseHandle(event_);
+#endif
+    }
+    MultiWait(const MultiWait&) = delete;
+    MultiWait& operator=(const MultiWait&) = delete;
+
+    void hit() {
+        unsigned left = remaining_.load();
+        while (left && !remaining_.compare_exchange_weak(left, left - 1)) {
+        }
+        if (left == 1) ++satisfied_;
+#ifdef _WIN32
+        waiter_->hit();
+#endif
+    }
+
+    // How often the wait was satisfied so far. Call it between any two hits: the event is consumed here, so that
+    // a second signal shows.
+    int satisfied() {
+#ifdef _WIN32
+        if (WaitForSingleObject(event_, 0) == WAIT_OBJECT_0) ++event_signals_;
+        EXPECT(event_signals_ == satisfied_.load());
+        EXPECT(waiter_->done() == (remaining_.load() == 0));
+#endif
+        return satisfied_.load();
+    }
+
+private:
+    std::atomic<unsigned> remaining_;
+    std::atomic<int> satisfied_{0};
+#ifdef _WIN32
+    HANDLE event_ = nullptr;
+    std::unique_ptr<rt::d3d12::FenceWaiter> waiter_;
+    int event_signals_ = 0;
+#endif
 };
 
 }  // namespace
@@ -454,7 +543,7 @@ int main() {
         });
         EXPECT(gate.wait_entered());
         context.cancel_fence_waits(released->semaphore());
-        // Complete when cancel() returns, not when the batch gets there: the caller may close its event now.
+        // Told when the cancel() that took them returns, not when the batch gets there.
         EXPECT(waits.notified.load() == 1 && g_events.load() == 1);
         context.cancel_fence_waits(released->semaphore());  // and not again
         released.reset();
@@ -464,6 +553,7 @@ int main() {
         EXPECT(waits.used_semaphore.load() == 0);  // the held Signal is still dropped
         EXPECT(waits.notified.load() == 1);        // and the multi-fence wait is not
         EXPECT(g_events.load() == 1);
+        EXPECT(batch_left_nothing(context));
         context.cancel_fence_waits(parked.semaphore());
         std::printf("fence dispatcher: cancel during a ready batch completes notifications once ok\n");
     }
@@ -501,77 +591,79 @@ int main() {
         EXPECT(later_waits.notified.load() == 1 && later_waits.used_semaphore.load() == 0);
         EXPECT(g_events.load() == 2);
         EXPECT(fresh.signal(1) && wait_until([&] { return fresh_ran.load() == 1; }));
+        EXPECT(batch_left_nothing(context));
         context.cancel_fence_waits(parked.semaphore());
         std::printf("fence dispatcher: re-entrant cancel during a ready batch completes notifications once ok\n");
     }
 
-#ifdef _WIN32
-    // 9. Multi-fence waits over three fences, every subset of them cancelled in the batch. ALL counts a cancelled fence
-    //    as reached, ANY is satisfied by one. The auto-reset event is set once: nothing sets it after it was consumed.
+    // 9. Multi-fence waits over three fences, released in every order: all of them before the first is dispatched, or
+    //    one before each. A gate before every notification stops the dispatcher there, so at most one fence is told
+    //    between two looks at the wait. ALL is satisfied by the third fence that is told, released or dispatched, ANY
+    //    by the first, and neither by any other.
     for (const bool any : {false, true}) {
-        for (unsigned cancelled = 0; cancelled < 8; ++cancelled) {
-            VulkanContext context(driver::get_device, d.device, true);
-            EXPECT(context.loaded());
-            VulkanFence parked(context, 0), front(context, 0), last(context, 0);
-            std::optional<VulkanFence> fences[3];
-            for (auto& fence : fences) fence.emplace(context, std::uint64_t{0});
-            const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            EXPECT(event);
-            const auto waiter = std::make_shared<rt::d3d12::FenceWaiter>(event, any ? 1u : 3u);
-            std::atomic<int> hits[3]{};
-            Gate gate;
-            std::atomic<bool> tail{false};
-            one_batch(context, parked, [&] {
-                context.enqueue_fence_callback(front.semaphore(), 1, [&] { gate.run(); });
-                for (int i = 0; i < 3; ++i)
-                    context.enqueue_fence_notification(fences[i]->semaphore(), 1, [w = waiter, &hits, i] {
-                        ++hits[i];
-                        w->hit();
-                    });
-                context.enqueue_fence_callback(last.semaphore(), 1, [&] { tail.store(true); });
-                EXPECT(front.signal(1) && last.signal(1));
-                for (auto& fence : fences) EXPECT(fence->signal(1));
-            });
-            EXPECT(gate.wait_entered());
-            EXPECT(!waiter->done() && WaitForSingleObject(event, 0) == WAIT_TIMEOUT);
-            for (unsigned i = 0; i < 3; ++i) {
-                if (!(cancelled & (1u << i))) continue;
-                context.cancel_fence_waits(fences[i]->semaphore());
-                fences[i].reset();
-                EXPECT(hits[i].load() == 1);
+        std::array<int, 3> order{0, 1, 2};
+        do {
+            for (const bool spread : {false, true}) {
+                VulkanContext context(driver::get_device, d.device, true);
+                EXPECT(context.loaded());
+                VulkanFence parked(context, 0), front(context, 0), last(context, 0);
+                std::optional<VulkanFence> fences[3];
+                for (auto& fence : fences) fence.emplace(context, std::uint64_t{0});
+                MultiWait wait(any ? 1u : 3u);
+                std::atomic<int> hits[3]{};
+                Gate gates[3];
+                std::atomic<bool> tail{false};
+                one_batch(context, parked, [&] {
+                    for (int i = 0; i < 3; ++i) {
+                        context.enqueue_fence_callback(front.semaphore(), 1, [&gates, i] { gates[i].run(); });
+                        context.enqueue_fence_notification(fences[i]->semaphore(), 1, [&wait, &hits, i] {
+                            ++hits[i];
+                            wait.hit();
+                        });
+                    }
+                    context.enqueue_fence_callback(last.semaphore(), 1, [&] { tail.store(true); });
+                    EXPECT(front.signal(1) && last.signal(1));
+                    for (auto& fence : fences) EXPECT(fence->signal(1));
+                });
+                std::array<bool, 3> told{};
+                const auto satisfied_as_told = [&] {
+                    const auto count = std::count(told.begin(), told.end(), true);
+                    return wait.satisfied() == int(any ? count > 0 : count == 3);
+                };
+                const auto release = [&](int i) {
+                    context.cancel_fence_waits(fences[i]->semaphore());
+                    fences[i].reset();
+                    told[i] = true;
+                    EXPECT(hits[i].load() == 1 && satisfied_as_told());
+                };
+                for (int step = 0; step < 3; ++step) {
+                    EXPECT(gates[step].wait_entered());
+                    if (step) told[step - 1] = true;  // dispatched since the last gate, if it was not released before
+                    EXPECT(satisfied_as_told());
+                    if (spread) release(order[step]);
+                    else if (!step) for (const int i : order) release(i);
+                    gates[step].open();
+                }
+                EXPECT(wait_until([&] { return tail.load(); }));
+                told[2] = true;
+                EXPECT(hits[0].load() == 1 && hits[1].load() == 1 && hits[2].load() == 1);
+                EXPECT(satisfied_as_told() && wait.satisfied() == 1);
+                EXPECT(batch_left_nothing(context));
+                context.cancel_fence_waits(parked.semaphore());
             }
-            // All of its fences released: the event is set, and the application can close it with the batch running.
-            // A second handle to it sees whether anything sets it after that.
-            HANDLE observer = event;
-            const bool early = any ? cancelled != 0 : cancelled == 7;
-            EXPECT(WaitForSingleObject(event, 0) == DWORD(early ? WAIT_OBJECT_0 : WAIT_TIMEOUT));
-            if (early) {
-                EXPECT(DuplicateHandle(GetCurrentProcess(), event, GetCurrentProcess(), &observer, 0, FALSE,
-                                       DUPLICATE_SAME_ACCESS));
-                CloseHandle(event);
-            }
-            gate.open();
-            EXPECT(wait_until([&] { return tail.load(); }));
-            EXPECT(hits[0].load() == 1 && hits[1].load() == 1 && hits[2].load() == 1 && waiter->done());
-            EXPECT(WaitForSingleObject(observer, 0) == DWORD(early ? WAIT_TIMEOUT : WAIT_OBJECT_0));
-            EXPECT(WaitForSingleObject(observer, 0) == WAIT_TIMEOUT);
-            context.cancel_fence_waits(parked.semaphore());
-            CloseHandle(observer);
-        }
+        } while (std::next_permutation(order.begin(), order.end()));
     }
-    // ALL with one fence cancelled in the batch and one that has not been reached waits for the latter; ANY's waits
-    // that are left over when the event was set and closed never use it.
+    // One fence cancelled in the batch and one that has not been reached: ALL waits for the latter, which adds nothing
+    // to ANY.
     for (const bool any : {false, true}) {
         VulkanContext context(driver::get_device, d.device, true);
         EXPECT(context.loaded());
         VulkanFence parked(context, 0), front(context, 0), last(context, 0), unreached(context, 0);
         std::optional<VulkanFence> released(std::in_place, context, std::uint64_t{0});
-        const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        EXPECT(event);
-        const auto waiter = std::make_shared<rt::d3d12::FenceWaiter>(event, any ? 1u : 2u);
+        MultiWait wait(any ? 1u : 2u);
         std::atomic<int> hits{0};
-        const auto hit = [w = waiter, &hits] {
-            w->hit();
+        const auto hit = [&wait, &hits] {
+            wait.hit();
             ++hits;
         };
         Gate gate;
@@ -586,28 +678,16 @@ int main() {
         EXPECT(gate.wait_entered());
         context.cancel_fence_waits(released->semaphore());
         released.reset();
+        EXPECT(hits.load() == 1 && wait.satisfied() == int(any));
         gate.open();
         EXPECT(wait_until([&] { return tail.load(); }));
-        EXPECT(hits.load() == 1 && waiter->done() == any);
-        EXPECT(WaitForSingleObject(event, 0) == DWORD(any ? WAIT_OBJECT_0 : WAIT_TIMEOUT));
-        if (any) {
-            // A second handle to the event sees whether anything sets it after the application closed its own.
-            HANDLE observer = nullptr;
-            EXPECT(DuplicateHandle(GetCurrentProcess(), event, GetCurrentProcess(), &observer, 0, FALSE,
-                                   DUPLICATE_SAME_ACCESS));
-            CloseHandle(event);
-            EXPECT(unreached.signal(1) && wait_until([&] { return hits.load() == 2; }));
-            EXPECT(WaitForSingleObject(observer, 0) == WAIT_TIMEOUT && waiter->remaining.load() == 0);
-            CloseHandle(observer);
-        } else {
-            EXPECT(unreached.signal(1) && WaitForSingleObject(event, 2000) == WAIT_OBJECT_0 && waiter->done());
-            EXPECT(wait_until([&] { return hits.load() == 2; }));
-            CloseHandle(event);
-        }
+        EXPECT(hits.load() == 1 && wait.satisfied() == int(any));
+        EXPECT(unreached.signal(1) && wait_until([&] { return hits.load() == 2; }));
+        EXPECT(wait.satisfied() == 1);
+        EXPECT(batch_left_nothing(context));
         context.cancel_fence_waits(parked.semaphore());
     }
-    std::printf("fence dispatcher: ALL and ANY waits survive fences cancelled in a ready batch ok\n");
-#endif
+    std::printf("fence dispatcher: ALL and ANY waits are satisfied once in every release order ok\n");
 
     // 10. Waits that are still pending: cancel() itself runs all of them before it returns, the held Signal too (its
     //     semaphore is destroyed after cancel(), and it finds its value not reached).
@@ -656,8 +736,51 @@ int main() {
         Waits after;  // a wait made after the loss completes on the spot
         after.enqueue(context, kept.semaphore(), 9);
         EXPECT(after.notified.load() == 1 && after.used_semaphore.load() == 1 && g_events.load() == 3);
+        EXPECT(batch_left_nothing(context));
         std::printf("fence dispatcher: cancel during the device-lost drain completes notifications once ok\n");
     }
+
+    // 12. One callback of a semaphore is running, its other waits have not started. cancel() on another thread takes
+    //     those (seen in the batch, so this does not hang on how far that thread got), and has to wait for the one that
+    //     runs, which may use the semaphore, before it tells them or returns. Whatever runs may be of either kind.
+    for (const bool running_notification : {false, true}) {
+        VulkanContext context(driver::get_device, d.device, true);
+        EXPECT(context.loaded());
+        g_events.store(0);
+        context.set_signal_event_fn([](void*) { ++g_events; });
+        VulkanFence parked(context, 0), last(context, 0);
+        std::optional<VulkanFence> released(std::in_place, context, std::uint64_t{0});
+        const VkSemaphore sem = released->semaphore();
+        Gate gate;
+        Waits waits;
+        std::atomic<bool> tail{false}, returned{false};
+        one_batch(context, parked, [&] {
+            if (running_notification) context.enqueue_fence_notification(sem, 1, [&] { gate.run(); });
+            else context.enqueue_fence_callback(sem, 1, [&] { gate.run(); });
+            waits.enqueue(context, sem, 1);
+            context.enqueue_fence_callback(last.semaphore(), 1, [&] { tail.store(true); });
+            EXPECT(released->signal(1) && last.signal(1));
+        });
+        EXPECT(gate.wait_entered());
+        std::thread canceller([&] {
+            context.cancel_fence_waits(sem);
+            returned.store(true);
+        });
+        EXPECT(wait_until([&] { return cancelled_slots(context, sem) == 3; }));
+        for (int i = 0; i < 100; ++i) {
+            EXPECT(!returned.load() && waits.notified.load() == 0 && g_events.load() == 0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        gate.open();
+        canceller.join();
+        EXPECT(waits.notified.load() == 1 && g_events.load() == 1 && waits.used_semaphore.load() == 0);
+        released.reset();
+        EXPECT(wait_until([&] { return tail.load(); }));
+        EXPECT(waits.notified.load() == 1 && g_events.load() == 1 && waits.used_semaphore.load() == 0);
+        EXPECT(batch_left_nothing(context));
+        context.cancel_fence_waits(parked.semaphore());
+    }
+    std::printf("fence dispatcher: cancel waits for the running callback and tells the rest after it ok\n");
 
     EXPECT(d.validation_errors() == 0);
     std::printf("vk_fence_dispatcher_sync_test: ok\n");
